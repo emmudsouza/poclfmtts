@@ -46,7 +46,8 @@ def evaluate(model, loader, device, use_amp, amp_dtype) -> float:
     return total / max(1, n)
 
 
-def build_optimizer(model: torch.nn.Module, lr: float, wd: float) -> torch.optim.Optimizer:
+def build_optimizer(model: torch.nn.Module, lr: float, wd: float,
+                    fused: bool = False) -> torch.optim.Optimizer:
     """AdamW with weight decay only on 2D+ tensors (not norms/biases/embeddings scale)."""
     decay, no_decay = [], []
     for p in model.parameters():
@@ -57,7 +58,7 @@ def build_optimizer(model: torch.nn.Module, lr: float, wd: float) -> torch.optim
         {"params": decay, "weight_decay": wd},
         {"params": no_decay, "weight_decay": 0.0},
     ]
-    return torch.optim.AdamW(groups, lr=lr, betas=(0.9, 0.95), eps=1e-8)
+    return torch.optim.AdamW(groups, lr=lr, betas=(0.9, 0.95), eps=1e-8, fused=fused)
 
 
 def lr_at(step: int, warmup: int, total: int, base_lr: float, min_lr: float) -> float:
@@ -116,16 +117,20 @@ def train(args: argparse.Namespace) -> None:
     model = PocketLFM(cfg).to(device)
     print(f"PocketLFM: {model.num_parameters() / 1e6:.2f}M params | device={device} | "
           f"amp={use_amp}({amp_dtype if use_amp else '-'})")
+    if args.compile:
+        model.compute_losses = torch.compile(model.compute_losses, dynamic=True)
 
     # --- data ---
+    preload = not args.no_preload
     if args.smoke:
         from data_ljspeech import collate
 
         dataset: Dataset = _SmokeDataset(args.smoke_size, cfg)
+        preload = False
     else:
         from data_ljspeech import LJSpeechLatents, collate
 
-        dataset = LJSpeechLatents(args.cache, max_frames=args.max_frames)
+        dataset = LJSpeechLatents(args.cache, max_frames=args.max_frames, preload=preload)
 
     # Deterministic train/val split (seeded so the held-out set is stable across runs).
     val_n = int(round(len(dataset) * args.val_split))
@@ -139,14 +144,17 @@ def train(args: argparse.Namespace) -> None:
     print(f"dataset: {len(dataset)} clips ({len(train_ds)} train / "
           f"{len(val_ds) if val_ds else 0} val)")
 
+    # Preloaded data lives in RAM, so workers (and their IPC) only add overhead.
+    workers = 0 if preload else args.workers
     loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.workers,
+        num_workers=workers,
         collate_fn=collate,
         pin_memory=(device == "cuda"),
         drop_last=True,
+        persistent_workers=(workers > 0),
     )
     val_loader = None
     if val_ds is not None:
@@ -154,13 +162,14 @@ def train(args: argparse.Namespace) -> None:
             val_ds,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=args.workers,
+            num_workers=workers,
             collate_fn=collate,
             pin_memory=(device == "cuda"),
             drop_last=False,
+            persistent_workers=(workers > 0),
         )
 
-    optim = build_optimizer(model, args.lr, args.weight_decay)
+    optim = build_optimizer(model, args.lr, args.weight_decay, fused=(device == "cuda"))
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
 
     out_dir = Path(args.out)
@@ -312,6 +321,9 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--no-amp", action="store_true", help="disable mixed precision")
     ap.add_argument("--bf16", action="store_true", help="use bf16 autocast (if GPU supports it)")
     ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--no-preload", action="store_true",
+                    help="stream the cache from disk instead of preloading it into RAM")
+    ap.add_argument("--compile", action="store_true", help="torch.compile the loss (dynamic shapes)")
     ap.add_argument("--log-every", type=int, default=20)
     ap.add_argument("--ckpt-every", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=0)

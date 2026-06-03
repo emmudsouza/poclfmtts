@@ -140,7 +140,8 @@ def preprocess(
 class LJSpeechLatents(Dataset):
     """Yields (tokens[Lt] long, latents[T, 32] float32) from the preprocessed cache."""
 
-    def __init__(self, cache_dir: str | Path, max_frames: int | None = None):
+    def __init__(self, cache_dir: str | Path, max_frames: int | None = None,
+                 preload: bool = True):
         self.cache_dir = Path(cache_dir)
         index_file = self.cache_dir / "index.txt"
         if not index_file.exists():
@@ -149,17 +150,23 @@ class LJSpeechLatents(Dataset):
             )
         self.ids = [line for line in index_file.read_text().splitlines() if line]
         self.max_frames = max_frames
+        self.records = [self._load(i) for i in range(len(self.ids))] if preload else None
+        if preload:
+            print(f"preloaded {len(self.records)} clips into RAM")
 
-    def __len__(self) -> int:
-        return len(self.ids)
-
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _load(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         rec = torch.load(self.cache_dir / f"{self.ids[idx]}.pt")
         tokens = rec["tokens"].long()
         latents = rec["latents"].float()
         if self.max_frames is not None and latents.shape[0] > self.max_frames:
             latents = latents[: self.max_frames]
         return tokens, latents
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.records[idx] if self.records is not None else self._load(idx)
 
 
 def collate(batch: list[tuple[torch.Tensor, torch.Tensor]]) -> dict[str, torch.Tensor]:
