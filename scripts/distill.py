@@ -41,8 +41,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Distill PocketTTS into a single-voice latent cache.")
     ap.add_argument("--root", default="data/LJSpeech-1.1", help="LJSpeech root (for text + voice)")
     ap.add_argument("--out", default="data/distill_cache")
-    ap.add_argument("--voice", default=None, help="voice prompt wav / hf:// URL; default builds one from LJSpeech")
-    ap.add_argument("--voice-clips", type=int, default=6, help="LJSpeech clips to concat for the default voice")
+    ap.add_argument("--voice", default="azelma",
+                    help="built-in voice name (e.g. azelma, alba, anna), a wav / hf:// URL, "
+                         "or 'ljspeech' to build a prompt from LJSpeech clips")
+    ap.add_argument("--voice-clips", type=int, default=6, help="LJSpeech clips for --voice ljspeech")
     ap.add_argument("--texts", default=None, help="text file (one per line); default = LJSpeech transcripts")
     ap.add_argument("--limit", type=int, default=2000, help="number of utterances to synthesize")
     ap.add_argument("--device", default=None)
@@ -58,12 +60,16 @@ def main() -> None:
     sr = int(mimi.sample_rate)
     tokenizer = tts.flow_lm.conditioner.tokenizer
 
-    if args.voice:
-        voice_state = tts.get_state_for_audio_prompt(args.voice)
-    else:
+    from pocket_tts.utils.utils import _ORIGINS_OF_PREDEFINED_VOICES as PREDEFINED
+
+    if args.voice == "ljspeech":
         prompt = build_voice_prompt(args.root, sr, args.voice_clips, device)
         voice_state = tts.get_state_for_audio_prompt(prompt)
-    print(f"voice prompt ready | device={device} | sr={sr}")
+        print(f"voice: LJSpeech ({args.voice_clips} clips) | device={device} | sr={sr}")
+    else:
+        origin = PREDEFINED.get(args.voice, args.voice)  # built-in name -> URL, else pass-through
+        voice_state = tts.get_state_for_audio_prompt(origin)
+        print(f"voice: {args.voice} -> {origin} | device={device} | sr={sr}")
 
     if args.texts:
         texts = [ln.strip() for ln in open(args.texts, encoding="utf-8") if ln.strip()]
