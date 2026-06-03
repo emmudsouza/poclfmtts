@@ -132,6 +132,21 @@ def train(args: argparse.Namespace) -> None:
 
         dataset = LJSpeechLatents(args.cache, max_frames=args.max_frames, preload=preload)
 
+    # Per-dim latent normalization stats — critical: raw Mimi latents are off-center and
+    # have a ~26x spread in per-dim std, which otherwise collapses the flow head to a drone.
+    if not args.smoke:
+        n, s, ss = 0, torch.zeros(cfg.latent_dim), torch.zeros(cfg.latent_dim)
+        for i in range(len(dataset)):
+            lat = dataset[i][1]
+            s += lat.sum(0)
+            ss += (lat * lat).sum(0)
+            n += lat.shape[0]
+        mean = s / n
+        std = (ss / n - mean ** 2).clamp(min=1e-8).sqrt()
+        model.set_latent_stats(mean, std)
+        print(f"latent stats: mean {mean.mean():.3f} std {std.mean():.3f} "
+              f"(per-dim std range {std.min():.3f}-{std.max():.3f})")
+
     # Deterministic train/val split (seeded so the held-out set is stable across runs).
     val_n = int(round(len(dataset) * args.val_split))
     if val_n > 0:

@@ -487,6 +487,18 @@ class PocketLFM(nn.Module):
         self.out_norm = RMSNorm(cfg.d_model, cfg.norm_eps)
         self.mtp = SequentialMTP(cfg)
         self.eos_head = nn.Linear(cfg.d_model, 1)
+        self.register_buffer("latent_mean", torch.zeros(cfg.latent_dim))
+        self.register_buffer("latent_std", torch.ones(cfg.latent_dim))
+
+    def set_latent_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        self.latent_mean.copy_(mean.to(self.latent_mean))
+        self.latent_std.copy_(std.clamp(min=1e-4).to(self.latent_std))
+
+    def normalize(self, latents: torch.Tensor) -> torch.Tensor:
+        return (latents - self.latent_mean) / self.latent_std
+
+    def denormalize(self, latents: torch.Tensor) -> torch.Tensor:
+        return latents * self.latent_std + self.latent_mean
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -525,6 +537,7 @@ class PocketLFM(nn.Module):
         k = self.cfg.mtp_horizon
         device = latents.device
         lat_lens = lat_lens.to(device)
+        latents = self.normalize(latents)
 
         memory, memory_mask = self._text_memory(text_tokens, text_lens)
         ref_mask = None
@@ -594,7 +607,7 @@ class PocketLFM(nn.Module):
             for k in range(self.cfg.mtp_horizon):
                 cond = self.mtp.depth(hidden[:, -1], prev if k > 0 else None)[:, k]
                 z = self.mtp.head.sample(cond, flow_steps, temp)
-                yield z
+                yield self.denormalize(z)
                 produced += 1
                 prev = torch.cat([prev, z[:, None, :]], dim=1)
                 if produced >= max_frames:
