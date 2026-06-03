@@ -5,8 +5,6 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "kaggle>=2.2.0",
-    "liquid-audio[demo]>=1.2.0",
     "pocket-tts>=2.1.0",
     "torch>=2.5.0",
 ]
