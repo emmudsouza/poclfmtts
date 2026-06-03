@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.pytest_cache
+
+# Data and training outputs
+data
+runs
+
+# Model checkpoints and weights
+*.pt
+*.ckpt
+*.safetensors
+
+# Generated audio
+*.wav
+
+# OS / editor
+.DS_Store
