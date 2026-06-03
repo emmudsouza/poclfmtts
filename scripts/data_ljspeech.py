@@ -36,17 +36,28 @@ def download_ljspeech(dest: str | Path) -> Path:
     """Download + extract LJSpeech-1.1 into `dest` (parent dir). Returns the dataset root."""
     dest = Path(dest)
     root = dest / "LJSpeech-1.1"
-    if (root / "metadata.csv").exists():
-        print(f"LJSpeech already present at {root}")
+    n_meta = len(read_metadata(root)) if (root / "metadata.csv").exists() else 0
+    n_wav = len(list((root / "wavs").glob("*.wav"))) if (root / "wavs").exists() else 0
+    if n_meta and n_wav >= n_meta:
+        print(f"LJSpeech already present at {root} ({n_wav} wav files)")
         return root
+    if n_meta:
+        print(f"LJSpeech incomplete ({n_wav}/{n_meta} wavs present) — re-extracting")
     dest.mkdir(parents=True, exist_ok=True)
     tar_path = dest / "LJSpeech-1.1.tar.bz2"
     if not tar_path.exists():
         print(f"Downloading LJSpeech (~2.6 GB) from {LJSPEECH_URL} ...")
         urllib.request.urlretrieve(LJSPEECH_URL, tar_path)
     print("Extracting ...")
-    with tarfile.open(tar_path, "r:bz2") as tf:
-        tf.extractall(dest)
+    try:
+        with tarfile.open(tar_path, "r:bz2") as tf:
+            tf.extractall(dest)
+    except (tarfile.TarError, EOFError):
+        print("Archive is corrupt — re-downloading ...")
+        tar_path.unlink(missing_ok=True)
+        urllib.request.urlretrieve(LJSPEECH_URL, tar_path)
+        with tarfile.open(tar_path, "r:bz2") as tf:
+            tf.extractall(dest)
     return root
 
 
