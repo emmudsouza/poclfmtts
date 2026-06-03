@@ -42,6 +42,10 @@ class PocketLFMConfig:
     attn_sink: int = 128
     eos_loss_weight: float = 1.0
 
+    # --- forcing text-conditioning (anti continuation-cheat) ---
+    input_noise: float = 0.0  # std of noise added to teacher-forced latent context in training
+    cross_attn_all: bool = False  # cross-attend to text on every layer, not just attention layers
+
     def __post_init__(self) -> None:
         assert self.d_model % self.n_heads == 0
         assert self.n_heads % self.n_kv_heads == 0
@@ -202,8 +206,9 @@ class BackboneLayer(nn.Module):
         self.is_attn = is_attn
         self.norm_mix = RMSNorm(cfg.d_model, cfg.norm_eps)
         self.mixer = WindowedSelfAttention(cfg) if is_attn else ShortConvMixer(cfg)
-        self.cross = CrossAttention(cfg) if is_attn else None
-        self.norm_cross = RMSNorm(cfg.d_model, cfg.norm_eps) if is_attn else None
+        use_cross = is_attn or cfg.cross_attn_all
+        self.cross = CrossAttention(cfg) if use_cross else None
+        self.norm_cross = RMSNorm(cfg.d_model, cfg.norm_eps) if use_cross else None
         self.norm_ff = RMSNorm(cfg.d_model, cfg.norm_eps)
         self.ff = SwiGLU(cfg.d_model, cfg.ff_dim)
 
@@ -549,6 +554,8 @@ class PocketLFM(nn.Module):
 
         bos = self.bos.view(1, 1, -1).expand(b, 1, -1)
         audio_in = torch.cat([bos, latents[:, :-1]], dim=1)
+        if self.training and self.cfg.input_noise > 0:
+            audio_in = audio_in + self.cfg.input_noise * torch.randn_like(audio_in)
         hidden = self.out_norm(
             self.backbone(self.latent_in(audio_in), text_memory=memory,
                           text_mask=memory_mask, global_cond=global_cond)

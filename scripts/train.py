@@ -114,11 +114,14 @@ def train(args: argparse.Namespace) -> None:
         torch.backends.cudnn.allow_tf32 = True
 
     cfg = PocketLFMConfig()
+    cfg.input_noise = args.input_noise
+    cfg.cross_attn_all = args.cross_attn_all
     model = PocketLFM(cfg).to(device)
     print(f"PocketLFM: {model.num_parameters() / 1e6:.2f}M params | device={device} | "
           f"amp={use_amp}({amp_dtype if use_amp else '-'})")
     if args.compile:
-        model.compute_losses = torch.compile(model.compute_losses, dynamic=True)
+        model.compute_losses = torch.compile(
+            model.compute_losses, dynamic=True)
 
     # --- data ---
     preload = not args.no_preload
@@ -130,7 +133,8 @@ def train(args: argparse.Namespace) -> None:
     else:
         from data_ljspeech import LJSpeechLatents, collate
 
-        dataset = LJSpeechLatents(args.cache, max_frames=args.max_frames, preload=preload)
+        dataset = LJSpeechLatents(
+            args.cache, max_frames=args.max_frames, preload=preload)
 
     # Per-dim latent normalization stats — critical: raw Mimi latents are off-center and
     # have a ~26x spread in per-dim std, which otherwise collapses the flow head to a drone.
@@ -184,8 +188,10 @@ def train(args: argparse.Namespace) -> None:
             persistent_workers=(workers > 0),
         )
 
-    optim = build_optimizer(model, args.lr, args.weight_decay, fused=(device == "cuda"))
-    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
+    optim = build_optimizer(
+        model, args.lr, args.weight_decay, fused=(device == "cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=(
+        use_amp and amp_dtype == torch.float16))
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -220,7 +226,8 @@ def train(args: argparse.Namespace) -> None:
         if "scaler" in ckpt and ckpt["scaler"]:
             scaler.load_state_dict(ckpt["scaler"])
         step = ckpt.get("step", 0)
-        start_epoch = ckpt.get("epoch", 0)  # epoch field is the count already completed
+        # epoch field is the count already completed
+        start_epoch = ckpt.get("epoch", 0)
         best_loss = ckpt.get("best_loss", float("inf"))
         print(f"resumed from {resume_path} at epoch {start_epoch} / step {step} "
               f"(best_loss {best_loss:.4f})")
@@ -251,7 +258,8 @@ def train(args: argparse.Namespace) -> None:
                     g["lr"] = lr_at(step // args.grad_accum, args.warmup, total_steps,
                                     args.lr, args.min_lr)
                 scaler.unscale_(optim)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), args.grad_clip)
                 scaler.step(optim)
                 scaler.update()
                 optim.zero_grad(set_to_none=True)
@@ -267,7 +275,8 @@ def train(args: argparse.Namespace) -> None:
             step += 1
             if step % args.ckpt_every == 0 and not args.smoke:
                 ckpt = out_dir / f"pocketlfm_step{step}.pt"
-                save_ckpt(ckpt, model, optim, scaler, cfg, step, epoch, best_loss)
+                save_ckpt(ckpt, model, optim, scaler,
+                          cfg, step, epoch, best_loss)
                 print(f"saved {ckpt}")
             if step >= total_steps:
                 done = True
@@ -281,7 +290,8 @@ def train(args: argparse.Namespace) -> None:
         run_val = val_loader is not None and (
             (epoch + 1) % args.val_every == 0 or epoch + 1 == n_epochs or done
         )
-        val_loss = evaluate(model, val_loader, device, use_amp, amp_dtype) if run_val else None
+        val_loss = evaluate(model, val_loader, device,
+                            use_amp, amp_dtype) if run_val else None
         metric = val_loss if val_loss is not None else train_mean
         metric_name = "val" if val_loss is not None else "train"
 
@@ -296,7 +306,8 @@ def train(args: argparse.Namespace) -> None:
                 best_loss = metric
                 save_ckpt(out_dir / "pocketlfm_best.pt", model, optim, scaler, cfg,
                           step, epoch + 1, best_loss)
-                print(f"  new best {metric_name} loss {metric:.4f} -> saved pocketlfm_best.pt")
+                print(
+                    f"  new best {metric_name} loss {metric:.4f} -> saved pocketlfm_best.pt")
             # "last" carries full state for seamless resume.
             save_ckpt(out_dir / "pocketlfm_last.pt", model, optim, scaler, cfg,
                       step, epoch + 1, best_loss)
@@ -312,7 +323,8 @@ def train(args: argparse.Namespace) -> None:
 
 def build_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Train PocketLFM on LJSpeech.")
-    ap.add_argument("--cache", default="data/ljspeech_cache", help="preprocessed latent cache dir")
+    ap.add_argument("--cache", default="data/ljspeech_cache",
+                    help="preprocessed latent cache dir")
     ap.add_argument("--out", default="runs/exp1", help="checkpoint output dir")
     ap.add_argument("--resume", default=None,
                     help="resume from a checkpoint path, or 'auto' for <out>/pocketlfm_last.pt")
@@ -320,10 +332,12 @@ def build_argparser() -> argparse.ArgumentParser:
     # 4 GB-friendly defaults
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--grad-accum", type=int, default=4)
-    ap.add_argument("--max-frames", type=int, default=600, help="truncate long clips (memory cap)")
+    ap.add_argument("--max-frames", type=int, default=600,
+                    help="truncate long clips (memory cap)")
     ap.add_argument("--val-split", type=float, default=0.02,
                     help="fraction of clips held out for validation (0 disables)")
-    ap.add_argument("--val-every", type=int, default=1, help="validate every N epochs")
+    ap.add_argument("--val-every", type=int, default=1,
+                    help="validate every N epochs")
     ap.add_argument("--epochs", type=int, default=None,
                     help="number of full passes over the dataset (overrides --steps)")
     ap.add_argument("--steps", type=int, default=20000,
@@ -333,17 +347,25 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--warmup", type=int, default=500)
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--grad-clip", type=float, default=1.0)
-    ap.add_argument("--no-amp", action="store_true", help="disable mixed precision")
-    ap.add_argument("--bf16", action="store_true", help="use bf16 autocast (if GPU supports it)")
+    ap.add_argument("--no-amp", action="store_true",
+                    help="disable mixed precision")
+    ap.add_argument("--bf16", action="store_true",
+                    help="use bf16 autocast (if GPU supports it)")
     ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--input-noise", type=float, default=0.0,
+                    help="std of noise on teacher-forced latent context; forces text use (try 0.5-1.0)")
+    ap.add_argument("--cross-attn-all", action="store_true",
+                    help="cross-attend to text on every backbone layer (more text pathway)")
     ap.add_argument("--no-preload", action="store_true",
                     help="stream the cache from disk instead of preloading it into RAM")
-    ap.add_argument("--compile", action="store_true", help="torch.compile the loss (dynamic shapes)")
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the loss (dynamic shapes)")
     ap.add_argument("--log-every", type=int, default=20)
     ap.add_argument("--ckpt-every", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=0)
     # smoke test
-    ap.add_argument("--smoke", action="store_true", help="run a few steps on synthetic data")
+    ap.add_argument("--smoke", action="store_true",
+                    help="run a few steps on synthetic data")
     ap.add_argument("--smoke-size", type=int, default=64)
     return ap
 
@@ -356,3 +378,15 @@ if __name__ == "__main__":
         cli.warmup = 2
         cli.log_every = 1
     train(cli)
+
+
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+# python scripts/train.py \
+#   --cache data/ljspeech_cache \
+#   --out runs/local_test \
+#   --epochs 5 --batch-size 8 --grad-accum 1 \
+#   --bf16 --val-split 0.02 --workers 0
+
+
+# python scripts/infer.py --ckpt runs/local_test/pocketlfm_best.pt \
+#   --text "the quick brown fox jumps over the lazy dog" --out test.wav --device cuda
