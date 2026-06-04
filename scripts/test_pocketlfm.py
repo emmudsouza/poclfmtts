@@ -56,7 +56,7 @@ def test_attention_sliding_window_bounds_memory():
             bb(torch.randn(1, 1, cfg.d_model), state)
     cap = cfg.attn_sink + cfg.attn_window
     for i in cfg.attn_layer_indices:
-        kv = state["layers"][i]["self"]
+        kv = state["layers"][i]["mix"]
         assert kv["k"].shape[2] == cap and kv["pos"].shape[0] == cap
 
 

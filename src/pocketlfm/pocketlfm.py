@@ -213,24 +213,23 @@ class BackboneLayer(nn.Module):
         self.ff = SwiGLU(cfg.d_model, cfg.ff_dim)
 
     def forward(self, x, layer_state, positions, streaming, memory, memory_mask):
+        mix_state = layer_state["mix"] if layer_state is not None else None
+        cross_state = layer_state["cross"] if layer_state is not None else None
         h = self.norm_mix(x)
         if self.is_attn:
-            self_state = layer_state["self"] if layer_state is not None else None
-            update, new_self = self.mixer(h, self_state, positions, streaming)
+            update, new_mix = self.mixer(h, mix_state, positions, streaming)
         else:
-            update, new_self = self.mixer(h, layer_state)
+            update, new_mix = self.mixer(h, mix_state)
         x = x + update
         new_cross = None
         if self.cross is not None and memory is not None:
-            cross_cache = None
-            if streaming:
-                cross_cache = layer_state["cross"] if layer_state is not None else {}
-            x = x + self.cross(self.norm_cross(x), memory, memory_mask, cross_cache)
-            new_cross = cross_cache
+            cache = (cross_state if cross_state is not None else {}) if streaming else None
+            x = x + self.cross(self.norm_cross(x), memory, memory_mask, cache)
+            new_cross = cache
         x = x + self.ff(self.norm_ff(x))
-        if self.is_attn:
-            return x, {"self": new_self, "cross": new_cross}
-        return x, new_self
+        if streaming:
+            return x, {"mix": new_mix, "cross": new_cross}
+        return x, None
 
 
 class LFMBackbone(nn.Module):
