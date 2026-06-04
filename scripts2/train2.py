@@ -47,9 +47,12 @@ def main() -> None:
     ap.add_argument("--input-noise", type=float, default=0.0)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--grad-accum", type=int, default=1)
+    ap.add_argument("--log-every", type=int, default=20)
     args = ap.parse_args()
 
     device = args.device
+    print(f"loading cache from {args.cache} ...", flush=True)
     dataset = LJSpeechLatents(args.cache, preload=True)
     if args.limit:
         dataset = Subset(dataset, range(min(len(dataset), args.limit)))
@@ -72,36 +75,53 @@ def main() -> None:
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     amp = args.bf16 and device == "cuda"
+    accum = max(1, args.grad_accum)
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    print(f"train={len(train_ds)} val={len(val_ds)} | device={device} | bf16={amp}")
+    n_batches = len(train_dl)
+    print(f"train={len(train_ds)} val={len(val_ds)} | device={device} | bf16={amp} | "
+          f"batch={args.batch_size} x accum {accum} = eff {args.batch_size * accum} | "
+          f"{n_batches} batches/epoch", flush=True)
 
     best = float("inf")
     for epoch in range(args.epochs):
         model.train()
-        running, steps, t0 = 0.0, 0, time.monotonic()
-        for batch in train_dl:
+        running, window, t0, last = 0.0, 0.0, time.monotonic(), time.monotonic()
+        opt.zero_grad()
+        for i, batch in enumerate(train_dl):
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
                 out_losses = model.loss(batch["text_tokens"], batch["text_lens"],
                                         batch["latents"].to(device), batch["lat_lens"])
-            loss = out_losses["total"]
-            opt.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            running += float(loss.detach())
-            steps += 1
-        train_loss = running / max(1, steps)
+            (out_losses["total"] / accum).backward()
+            if (i + 1) % accum == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                opt.zero_grad()
+            running += float(out_losses["total"].detach())
+            window += float(out_losses["total"].detach())
+
+            if (i + 1) % args.log_every == 0:
+                now = time.monotonic()
+                ms = (now - last) / args.log_every * 1000
+                last = now
+                eta = (n_batches - i - 1) * ms / 1000
+                print(f"  ep {epoch + 1} [{i + 1:>5}/{n_batches}] "
+                      f"loss {window / args.log_every:.4f} | {ms:.0f} ms/it | "
+                      f"eta {eta / 60:.1f} min", flush=True)
+                window = 0.0
+
+        train_loss = running / max(1, n_batches)
         val_loss = evaluate(model, val_dl, device)
         dt = time.monotonic() - t0
-        print(f"epoch {epoch + 1}/{args.epochs} ({steps} steps, {dt:.0f}s) | "
-              f"train {train_loss:.4f} | val {val_loss:.4f}")
+        print(f"epoch {epoch + 1}/{args.epochs} done ({dt:.0f}s) | "
+              f"train {train_loss:.4f} | val {val_loss:.4f}", flush=True)
 
         ckpt = {"cfg": asdict(cfg), "model": model.state_dict()}
         torch.save(ckpt, out / "lfm2_last.pt")
         if val_loss < best:
             best = val_loss
             torch.save(ckpt, out / "lfm2_best.pt")
+            print(f"  saved best (val {val_loss:.4f}) -> {out / 'lfm2_best.pt'}", flush=True)
 
 
 if __name__ == "__main__":
