@@ -260,10 +260,10 @@ class MTPHeads(nn.Module):
         return self.head.loss(cond[mask], targets[mask])
 
     def sample(self, hidden, steps, temp):
-        return torch.stack(
-            [self.head.sample(hidden + self.offsets[k], steps, temp) for k in range(self.horizon)],
-            dim=1,
-        )
+        b = hidden.shape[0]
+        cond = (hidden[:, None, :] + self.offsets[None, :, :]).reshape(b * self.horizon, -1)
+        z = self.head.sample(cond, steps, temp)
+        return z.reshape(b, self.horizon, self.latent_dim)
 
 
 class TextEmbedder(nn.Module):
