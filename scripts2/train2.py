@@ -204,11 +204,13 @@ def main() -> None:
             if (i + 1) % accum == 0:
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(core.parameters(), 1.0)
+                prev_scale = scaler.get_scale()
                 scaler.step(opt)
                 scaler.update()
-                scheduler.step()
-                if ema is not None:
-                    ema.update(core)
+                if scaler.get_scale() >= prev_scale:  # optimizer actually stepped (no fp16 overflow)
+                    scheduler.step()
+                    if ema is not None:
+                        ema.update(core)
                 opt.zero_grad()
                 opt_steps += 1
                 global_step += 1
