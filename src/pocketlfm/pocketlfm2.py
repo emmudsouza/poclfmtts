@@ -256,14 +256,8 @@ class MTPHeads(nn.Module):
         self.head = FlowHead(cfg)
 
     def loss(self, hidden, targets, mask):
-        total = hidden.new_zeros(())
-        count = 0
-        for k in range(self.horizon):
-            m = mask[:, k]
-            if m.any():
-                total = total + self.head.loss(hidden[m] + self.offsets[k], targets[m, k])
-                count += 1
-        return total / max(1, count)
+        cond = hidden[:, None, :] + self.offsets[None, :, :]
+        return self.head.loss(cond[mask], targets[mask])
 
     def sample(self, hidden, steps, temp):
         return torch.stack(
@@ -325,31 +319,29 @@ class PocketLFM2(nn.Module):
             "total": self.num_parameters() / 1e6,
         }
 
+    def _left_align(self, tokens, lengths):
+        lt = tokens.shape[1]
+        idx = torch.arange(lt, device=tokens.device)[None, :] - (lt - lengths[:, None])
+        rolled = torch.gather(tokens, 1, idx.clamp(min=0))
+        return torch.where(idx >= 0, rolled, torch.full_like(rolled, self.text.pad))
+
     def loss(self, text_tokens, text_lens, latents, lat_lens) -> dict[str, torch.Tensor]:
         device = latents.device
         text_lens, lat_lens = text_lens.to(device), lat_lens.to(device)
         data = self.normalize(latents)
         b, s, ld = data.shape
         k = self.cfg.mtp_horizon
-        d = self.cfg.d_model
+        lt_max = text_tokens.shape[1]
 
-        text_emb = self.text(text_tokens.to(device), text_lens)
+        text_emb = self.text(self._left_align(text_tokens.to(device), text_lens), None)
         ctx = data
         if self.training and self.cfg.input_noise > 0:
             ctx = data + self.cfg.input_noise * torch.randn_like(data)
 
-        seqs = []
-        for i in range(b):
-            lt, n = int(text_lens[i]), int(lat_lens[i])
-            audio_in = torch.cat([self.bos[None], ctx[i, : n - 1]], dim=0)
-            seqs.append(torch.cat([text_emb[i, :lt], self.latent_in(audio_in)], dim=0))
-        packed = nn.utils.rnn.pad_sequence(seqs, batch_first=True)
+        audio_in = torch.cat([self.bos[None, None, :].expand(b, 1, ld), ctx[:, :-1]], dim=1)
+        packed = torch.cat([text_emb, self.latent_in(audio_in)], dim=1)
         hidden = self.out_norm(self.backbone(packed))
-
-        audio_h = data.new_zeros(b, s, d)
-        for i in range(b):
-            lt, n = int(text_lens[i]), int(lat_lens[i])
-            audio_h[i, :n] = hidden[i, lt: lt + n]
+        audio_h = hidden[:, lt_max:]
 
         lat_mask = torch.arange(s, device=device)[None, :] < lat_lens[:, None]
         targets = data.new_zeros(b, s, k, ld)
@@ -360,7 +352,7 @@ class PocketLFM2(nn.Module):
                 mask[:, : s - j, j] = lat_mask[:, j:] & lat_mask[:, : s - j]
 
         flow_loss = self.mtp.loss(
-            audio_h.reshape(b * s, d), targets.reshape(b * s, k, ld), mask.reshape(b * s, k)
+            audio_h.reshape(b * s, -1), targets.reshape(b * s, k, ld), mask.reshape(b * s, k)
         )
 
         eos_logits = self.eos(audio_h).squeeze(-1)

@@ -42,6 +42,7 @@ def main() -> None:
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--bf16", action="store_true")
+    ap.add_argument("--compile", action="store_true")
     ap.add_argument("--val-split", type=float, default=0.02)
     ap.add_argument("--input-noise", type=float, default=0.0)
     ap.add_argument("--limit", type=int, default=None)
@@ -60,6 +61,8 @@ def main() -> None:
     model.set_latent_stats(mean, std)
     for key, val in model.param_breakdown().items():
         print(f"  {key:10s}: {val:6.1f}M")
+    if args.compile:
+        model = torch.compile(model)
 
     n_val = max(1, int(len(dataset) * args.val_split))
     train_ds, val_ds = random_split(dataset, [len(dataset) - n_val, n_val])
