@@ -75,12 +75,13 @@ def main() -> None:
         prompt = build_voice_prompt(args.root, sr, args.voice_clips, device)
         voice_state = tts.get_state_for_audio_prompt(prompt)
         print(
-            f"voice: LJSpeech ({args.voice_clips} clips) | device={device} | sr={sr}")
+            f"voice: LJSpeech ({args.voice_clips} clips) | device={device} | sr={sr}", flush=True)
     else:
         # built-in name -> URL, else pass-through
         origin = PREDEFINED.get(args.voice, args.voice)
         voice_state = tts.get_state_for_audio_prompt(origin)
-        print(f"voice: {args.voice} -> {origin} | device={device} | sr={sr}")
+        print(f"voice: {args.voice} -> {origin} | device={device} | sr={sr} | "
+              f"shard {args.shard_id}/{args.shards}", flush=True)
 
     if args.texts:
         texts = [ln.strip()
