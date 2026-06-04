@@ -115,7 +115,6 @@ def train(args: argparse.Namespace) -> None:
 
     cfg = PocketLFMConfig()
     cfg.input_noise = args.input_noise
-    cfg.cross_attn_all = args.cross_attn_all
     model = PocketLFM(cfg).to(device)
     print(f"PocketLFM: {model.num_parameters() / 1e6:.2f}M params | device={device} | "
           f"amp={use_amp}({amp_dtype if use_amp else '-'})")
@@ -353,9 +352,7 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="use bf16 autocast (if GPU supports it)")
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--input-noise", type=float, default=0.0,
-                    help="std of noise on teacher-forced latent context; forces text use (try 0.5-1.0)")
-    ap.add_argument("--cross-attn-all", action="store_true",
-                    help="cross-attend to text on every backbone layer (more text pathway)")
+                    help="std of noise on teacher-forced latent context; discourages copy-continuation")
     ap.add_argument("--no-preload", action="store_true",
                     help="stream the cache from disk instead of preloading it into RAM")
     ap.add_argument("--compile", action="store_true",

@@ -36,13 +36,12 @@ def test_backbone_streaming_equivalence():
     cfg = small_cfg()
     bb = LFMBackbone(cfg).eval()
     x = torch.randn(1, 9, cfg.d_model)
-    mem = torch.randn(1, 5, cfg.d_model)
     with torch.no_grad():
-        full = bb(x, text_memory=mem)
+        full = bb(x)
         state = bb.init_state()
         outs = []
         for chunk in [x[:, :4], x[:, 4:5], x[:, 5:6], x[:, 6:9]]:
-            outs.append(bb(chunk, state, text_memory=mem))
+            outs.append(bb(chunk, state))
         stream = torch.cat(outs, dim=1)
     assert torch.allclose(full, stream, atol=1e-5), (full - stream).abs().max().item()
 

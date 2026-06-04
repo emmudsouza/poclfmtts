@@ -16,7 +16,7 @@ class PocketLFMConfig:
     n_heads: int = 16
     n_kv_heads: int = 8
     conv_kernel: int = 3
-    ff_dim: int = 2496
+    ff_dim: int = 2816
     rope_theta: float = 10_000.0
     norm_eps: float = 1e-5
 
@@ -41,10 +41,7 @@ class PocketLFMConfig:
     attn_window: int | None = 384
     attn_sink: int = 128
     eos_loss_weight: float = 1.0
-
-    # --- forcing text-conditioning (anti continuation-cheat) ---
-    input_noise: float = 0.0  # std of noise added to teacher-forced latent context in training
-    cross_attn_all: bool = False  # cross-attend to text on every layer, not just attention layers
+    input_noise: float = 0.0
 
     def __post_init__(self) -> None:
         assert self.d_model % self.n_heads == 0
@@ -172,63 +169,26 @@ class WindowedSelfAttention(nn.Module):
         return out, {"k": k_s, "v": v_s, "pos": pos_s}
 
 
-class CrossAttention(nn.Module):
-    def __init__(self, cfg: PocketLFMConfig):
-        super().__init__()
-        self.nh = cfg.n_heads
-        self.nkv = cfg.n_kv_heads
-        self.dh = cfg.head_dim_per_head
-        d = cfg.d_model
-        self.q_proj = nn.Linear(d, self.nh * self.dh, bias=False)
-        self.k_proj = nn.Linear(d, self.nkv * self.dh, bias=False)
-        self.v_proj = nn.Linear(d, self.nkv * self.dh, bias=False)
-        self.o_proj = nn.Linear(self.nh * self.dh, d, bias=False)
-
-    def forward(self, x, memory, memory_mask, cache=None):
-        b, t, _ = x.shape
-        q = self.q_proj(x).view(b, t, self.nh, self.dh).transpose(1, 2)
-        if cache is not None and "k" in cache:
-            k, v = cache["k"], cache["v"]
-        else:
-            s = memory.shape[1]
-            k = self.k_proj(memory).view(b, s, self.nkv, self.dh).transpose(1, 2)
-            v = self.v_proj(memory).view(b, s, self.nkv, self.dh).transpose(1, 2)
-            if cache is not None:
-                cache["k"], cache["v"] = k, v
-        mask = memory_mask[:, None, None, :] if memory_mask is not None else None
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
-        return self.o_proj(out.transpose(1, 2).reshape(b, t, self.nh * self.dh))
-
-
 class BackboneLayer(nn.Module):
     def __init__(self, cfg: PocketLFMConfig, is_attn: bool):
         super().__init__()
         self.is_attn = is_attn
         self.norm_mix = RMSNorm(cfg.d_model, cfg.norm_eps)
         self.mixer = WindowedSelfAttention(cfg) if is_attn else ShortConvMixer(cfg)
-        use_cross = is_attn or cfg.cross_attn_all
-        self.cross = CrossAttention(cfg) if use_cross else None
-        self.norm_cross = RMSNorm(cfg.d_model, cfg.norm_eps) if use_cross else None
         self.norm_ff = RMSNorm(cfg.d_model, cfg.norm_eps)
         self.ff = SwiGLU(cfg.d_model, cfg.ff_dim)
 
-    def forward(self, x, layer_state, positions, streaming, memory, memory_mask):
+    def forward(self, x, layer_state, positions, streaming):
         mix_state = layer_state["mix"] if layer_state is not None else None
-        cross_state = layer_state["cross"] if layer_state is not None else None
         h = self.norm_mix(x)
         if self.is_attn:
             update, new_mix = self.mixer(h, mix_state, positions, streaming)
         else:
             update, new_mix = self.mixer(h, mix_state)
         x = x + update
-        new_cross = None
-        if self.cross is not None and memory is not None:
-            cache = (cross_state if cross_state is not None else {}) if streaming else None
-            x = x + self.cross(self.norm_cross(x), memory, memory_mask, cache)
-            new_cross = cache
         x = x + self.ff(self.norm_ff(x))
         if streaming:
-            return x, {"mix": new_mix, "cross": new_cross}
+            return x, {"mix": new_mix}
         return x, None
 
 
@@ -244,7 +204,7 @@ class LFMBackbone(nn.Module):
     def init_state(self) -> dict:
         return {"offset": 0, "layers": [None] * len(self.layers)}
 
-    def forward(self, x, state=None, text_memory=None, text_mask=None, global_cond=None):
+    def forward(self, x, state=None, global_cond=None):
         if global_cond is not None:
             x = x + global_cond[:, None, :]
         t = x.shape[1]
@@ -253,7 +213,7 @@ class LFMBackbone(nn.Module):
         streaming = state is not None
         for i, layer in enumerate(self.layers):
             ls = None if state is None else state["layers"][i]
-            x, new_state = layer(x, ls, positions, streaming, text_memory, text_mask)
+            x, new_state = layer(x, ls, positions, streaming)
             if state is not None:
                 state["layers"][i] = new_state
         if state is not None:
@@ -464,18 +424,6 @@ class SequentialMTP(nn.Module):
                 count += 1
         return total / max(1, count)
 
-    @torch.no_grad()
-    def sample(self, hidden, steps, temp):
-        n = hidden.shape[0]
-        prev = hidden.new_zeros(n, 0, self.latent_dim)
-        outs = []
-        for k in range(self.horizon):
-            cond = self.depth(hidden, prev if k > 0 else None)[:, k]
-            z = self.head.sample(cond, steps, temp)
-            outs.append(z)
-            prev = torch.cat([prev, z[:, None, :]], dim=1)
-        return torch.stack(outs, dim=1)
-
 
 class PocketLFM(nn.Module):
     def __init__(self, cfg: PocketLFMConfig):
@@ -528,37 +476,49 @@ class PocketLFM(nn.Module):
             emotion = torch.zeros(batch_size, dtype=torch.long, device=device)
         return self.cond_proj(speaker + self.emotion(emotion))
 
-    def _text_memory(self, text_tokens, text_lens):
-        t_max = text_tokens.shape[1]
-        mask = torch.arange(t_max, device=text_tokens.device)[None, :] < text_lens.to(
-            text_tokens.device
-        )[:, None]
-        return self.text_encoder(text_tokens, mask), mask
+    def _text_prefix(self, text_tokens, text_lens):
+        device = text_tokens.device
+        mask = torch.arange(text_tokens.shape[1], device=device)[None, :] < text_lens.to(device)[:, None]
+        return self.text_encoder(text_tokens, mask)
 
-    def compute_losses(self, text_tokens, text_lens, latents, lat_lens,
-                       ref_latents=None, ref_lens=None, emotion=None) -> dict[str, torch.Tensor]:
-        b, t_max, _ = latents.shape
-        k = self.cfg.mtp_horizon
-        device = latents.device
-        lat_lens = lat_lens.to(device)
-        latents = self.normalize(latents)
-
-        memory, memory_mask = self._text_memory(text_tokens, text_lens)
+    def _global_cond(self, b, device, ref_latents, ref_lens, emotion):
         ref_mask = None
         if ref_latents is not None and ref_lens is not None:
             ref_mask = torch.arange(ref_latents.shape[1], device=device)[None, :] < ref_lens.to(
                 device
             )[:, None]
-        global_cond = self._conditioning(b, device, ref_latents, ref_mask, emotion)
+        return self._conditioning(b, device, ref_latents, ref_mask, emotion)
 
-        bos = self.bos.view(1, 1, -1).expand(b, 1, -1)
-        audio_in = torch.cat([bos, latents[:, :-1]], dim=1)
+    def compute_losses(self, text_tokens, text_lens, latents, lat_lens,
+                       ref_latents=None, ref_lens=None, emotion=None) -> dict[str, torch.Tensor]:
+        b, t_max, _ = latents.shape
+        k = self.cfg.mtp_horizon
+        d = self.cfg.d_model
+        device = latents.device
+        text_lens = text_lens.to(device)
+        lat_lens = lat_lens.to(device)
+        latents = self.normalize(latents)
+
+        text_emb = self._text_prefix(text_tokens, text_lens)
+        global_cond = self._global_cond(b, device, ref_latents, ref_lens, emotion)
+
+        ctx = latents
         if self.training and self.cfg.input_noise > 0:
-            audio_in = audio_in + self.cfg.input_noise * torch.randn_like(audio_in)
-        hidden = self.out_norm(
-            self.backbone(self.latent_in(audio_in), text_memory=memory,
-                          text_mask=memory_mask, global_cond=global_cond)
-        )
+            ctx = latents + self.cfg.input_noise * torch.randn_like(latents)
+
+        seqs = []
+        for i in range(b):
+            lt, t = int(text_lens[i]), int(lat_lens[i])
+            bos = self.bos.unsqueeze(0)
+            audio_in = torch.cat([bos, ctx[i, : t - 1]], dim=0)
+            seqs.append(torch.cat([text_emb[i, :lt], self.latent_in(audio_in)], dim=0))
+        packed = nn.utils.rnn.pad_sequence(seqs, batch_first=True)
+        hidden = self.out_norm(self.backbone(packed, global_cond=global_cond))
+
+        audio_h = latents.new_zeros(b, t_max, d)
+        for i in range(b):
+            lt, t = int(text_lens[i]), int(lat_lens[i])
+            audio_h[i, :t] = hidden[i, lt: lt + t]
 
         lat_mask = torch.arange(t_max, device=device)[None, :] < lat_lens[:, None]
         targets = latents.new_zeros(b, t_max, k, self.cfg.latent_dim)
@@ -568,12 +528,13 @@ class PocketLFM(nn.Module):
                 targets[:, : t_max - j, j] = latents[:, j:]
                 mask[:, : t_max - j, j] = lat_mask[:, j:] & lat_mask[:, : t_max - j]
 
-        flat_hidden = hidden.reshape(b * t_max, -1)
-        flat_targets = targets.reshape(b * t_max, k, self.cfg.latent_dim)
-        flat_mask = mask.reshape(b * t_max, k)
-        mtp = self.mtp.loss(flat_hidden, flat_targets, flat_mask)
+        mtp = self.mtp.loss(
+            audio_h.reshape(b * t_max, -1),
+            targets.reshape(b * t_max, k, self.cfg.latent_dim),
+            mask.reshape(b * t_max, k),
+        )
 
-        eos_logits = self.eos_head(hidden).squeeze(-1)
+        eos_logits = self.eos_head(audio_h).squeeze(-1)
         eos_target = torch.zeros(b, t_max, device=device)
         eos_target[torch.arange(b, device=device), (lat_lens - 1).clamp(min=0)] = 1.0
         eos = F.binary_cross_entropy_with_logits(eos_logits[lat_mask], eos_target[lat_mask])
@@ -581,31 +542,19 @@ class PocketLFM(nn.Module):
         total = mtp + self.cfg.eos_loss_weight * eos
         return {"mtp": mtp, "eos": eos, "total": total}
 
-    def _encode_context(self, text_tokens, ref_latents, ref_lens, emotion):
-        b = text_tokens.shape[0]
-        device = text_tokens.device
-        text_lens = torch.full((b,), text_tokens.shape[1], device=device)
-        memory, memory_mask = self._text_memory(text_tokens, text_lens)
-        ref_mask = None
-        if ref_latents is not None and ref_lens is not None:
-            ref_mask = torch.arange(ref_latents.shape[1], device=device)[None, :] < ref_lens.to(
-                device
-            )[:, None]
-        global_cond = self._conditioning(b, device, ref_latents, ref_mask, emotion)
-        return memory, memory_mask, global_cond
-
     @torch.no_grad()
     def stream_latents(self, text_tokens, max_frames, flow_steps=1, temp=1.0,
                       eos_threshold=0.0, ref_latents=None, ref_lens=None, emotion=None):
         b = text_tokens.shape[0]
-        memory, memory_mask, global_cond = self._encode_context(
-            text_tokens, ref_latents, ref_lens, emotion
-        )
+        device = text_tokens.device
+        text_lens = torch.full((b,), text_tokens.shape[1], device=device)
+        text_emb = self._text_prefix(text_tokens, text_lens)
+        global_cond = self._global_cond(b, device, ref_latents, ref_lens, emotion)
+
         state = self.backbone.init_state()
+        self.backbone(text_emb, state, global_cond=global_cond)
         bos = self.bos.view(1, 1, -1).expand(b, 1, -1)
-        hidden = self.out_norm(
-            self.backbone(self.latent_in(bos), state, memory, memory_mask, global_cond)
-        )
+        hidden = self.out_norm(self.backbone(self.latent_in(bos), state, global_cond=global_cond))
 
         produced = 0
         while produced < max_frames:
@@ -619,7 +568,7 @@ class PocketLFM(nn.Module):
                 if produced >= max_frames:
                     return
             hidden = self.out_norm(
-                self.backbone(self.latent_in(prev), state, memory, memory_mask, global_cond)
+                self.backbone(self.latent_in(prev), state, global_cond=global_cond)
             )
             if (self.eos_head(hidden[:, -1:]) > eos_threshold).all():
                 return
