@@ -53,6 +53,9 @@ def main() -> None:
                     help="text file (one per line); default = LJSpeech transcripts")
     ap.add_argument("--limit", type=int, default=2000,
                     help="number of utterances to synthesize")
+    ap.add_argument("--shards", type=int, default=1,
+                    help="split the work into N processes (run one per shard-id to use the GPU fully)")
+    ap.add_argument("--shard-id", type=int, default=0, help="which shard this process handles (0..shards-1)")
     ap.add_argument("--device", default=None)
     ap.add_argument("--language", default="english")
     args = ap.parse_args()
@@ -92,11 +95,12 @@ def main() -> None:
 
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    index, done, skipped = [], 0, 0
+    done, skipped = 0, 0
     for i, (cid, text) in enumerate(zip(ids, texts)):
+        if i % args.shards != args.shard_id:
+            continue
         path = out / f"{cid}.pt"
         if path.exists():
-            index.append(cid)
             continue
         try:
             with torch.no_grad():
@@ -115,18 +119,19 @@ def main() -> None:
             tokens = torch.tensor(tokenizer.sp.encode(
                 text, out_type=int), dtype=torch.long)
             torch.save({"tokens": tokens, "latents": latent}, path)
-            index.append(cid)
             done += 1
         except Exception as exc:  # noqa: BLE001 - skip a bad utterance, keep going
             skipped += 1
             if skipped <= 5:
                 print(f"  skip {cid}: {exc}")
-        if (i + 1) % 100 == 0:
-            print(
-                f"  {i + 1}/{len(ids)} synthesized ({done} ok, {skipped} skipped)")
+        if done and done % 100 == 0:
+            print(f"  shard {args.shard_id}/{args.shards}: {done} done, "
+                  f"{skipped} skipped", flush=True)
 
-    (out / "index.txt").write_text("\n".join(index))
-    print(f"Done. {len(index)} clips distilled to {out} (skipped {skipped}).")
+    all_ids = sorted(p.stem for p in out.glob("*.pt"))
+    (out / "index.txt").write_text("\n".join(all_ids))
+    print(f"Done. shard {args.shard_id}/{args.shards}: +{done} new ({skipped} skipped). "
+          f"cache total {len(all_ids)} clips in {out}.", flush=True)
 
 
 if __name__ == "__main__":
