@@ -56,6 +56,8 @@ def main() -> None:
     ap.add_argument("--shards", type=int, default=1,
                     help="split the work into N processes (run one per shard-id to use the GPU fully)")
     ap.add_argument("--shard-id", type=int, default=0, help="which shard this process handles (0..shards-1)")
+    ap.add_argument("--max-tokens", type=int, default=50,
+                    help="skip texts longer than this many tokens (teacher chunk limit; avoids skipped words)")
     ap.add_argument("--device", default=None)
     ap.add_argument("--language", default="english")
     args = ap.parse_args()
@@ -96,12 +98,16 @@ def main() -> None:
 
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    done, skipped = 0, 0
+    done, skipped, too_long = 0, 0, 0
     for i, (cid, text) in enumerate(zip(ids, texts)):
         if i % args.shards != args.shard_id:
             continue
         path = out / f"{cid}.pt"
         if path.exists():
+            continue
+        token_ids = tokenizer.sp.encode(text, out_type=int)
+        if len(token_ids) > args.max_tokens:
+            too_long += 1
             continue
         try:
             with torch.no_grad():
@@ -117,8 +123,7 @@ def main() -> None:
                 latent = mimi.encode_to_latent(audio)  # [1, 32, T]
             latent = latent[0].transpose(0, 1).contiguous().to(
                 "cpu", torch.float16)  # [T, 32]
-            tokens = torch.tensor(tokenizer.sp.encode(
-                text, out_type=int), dtype=torch.long)
+            tokens = torch.tensor(token_ids, dtype=torch.long)
             torch.save({"tokens": tokens, "latents": latent}, path)
             done += 1
         except Exception as exc:  # noqa: BLE001 - skip a bad utterance, keep going
@@ -127,11 +132,12 @@ def main() -> None:
                 print(f"  skip {cid}: {exc}")
         if done and done % 100 == 0:
             print(f"  shard {args.shard_id}/{args.shards}: {done} done, "
-                  f"{skipped} skipped", flush=True)
+                  f"{skipped} skipped, {too_long} too-long", flush=True)
 
     all_ids = sorted(p.stem for p in out.glob("*.pt"))
     (out / "index.txt").write_text("\n".join(all_ids))
-    print(f"Done. shard {args.shard_id}/{args.shards}: +{done} new ({skipped} skipped). "
+    print(f"Done. shard {args.shard_id}/{args.shards}: +{done} new "
+          f"({skipped} errored, {too_long} too-long >{args.max_tokens} tok). "
           f"cache total {len(all_ids)} clips in {out}.", flush=True)
 
 
