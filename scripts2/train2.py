@@ -51,7 +51,9 @@ def main() -> None:
     ap.add_argument("--log-every", type=int, default=20)
     ap.add_argument("--save-every", type=int, default=0,
                     help="also checkpoint every N optimizer steps (0 = only per epoch)")
-    ap.add_argument("--resume", default=None, help="resume from a checkpoint (model+optimizer+epoch)")
+    ap.add_argument("--resume", default=None, help="resume same run (model+optimizer+epoch+best)")
+    ap.add_argument("--init-from", default=None,
+                    help="warm-start weights from a checkpoint (fresh optimizer/epochs); for fine-tuning")
     args = ap.parse_args()
 
     device = args.device
@@ -94,6 +96,11 @@ def main() -> None:
         best = ck.get("best", float("inf"))
         start_epoch = ck.get("epoch", 0)
         print(f"resumed from {args.resume} @ epoch {start_epoch} (best val {best:.4f})", flush=True)
+    elif args.init_from:
+        ck = torch.load(args.init_from, map_location=device, mmap=True)
+        core.load_state_dict(ck["model"])
+        print(f"warm-started weights from {args.init_from} "
+              f"(fresh optimizer/epochs; keeping its latent stats)", flush=True)
 
     print(f"train={len(train_ds)} val={len(val_ds)} | device={device} | bf16={amp} | "
           f"batch={args.batch_size} x accum {accum} = eff {args.batch_size * accum} | "
