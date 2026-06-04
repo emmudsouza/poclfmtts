@@ -41,7 +41,8 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--bf16", action="store_true")
+    ap.add_argument("--bf16", action="store_true", help="bfloat16 autocast (Ampere+; safe everywhere, no speedup on T4/P100)")
+    ap.add_argument("--fp16", action="store_true", help="float16 autocast + GradScaler (uses T4 tensor cores; ~2x on Turing)")
     ap.add_argument("--compile", action="store_true")
     ap.add_argument("--val-split", type=float, default=0.02)
     ap.add_argument("--input-noise", type=float, default=0.0)
@@ -80,7 +81,9 @@ def main() -> None:
     val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
 
     opt = torch.optim.AdamW(core.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    amp = args.bf16 and device == "cuda"
+    use_amp = (args.bf16 or args.fp16) and device == "cuda"
+    amp_dtype = torch.float16 if args.fp16 else torch.bfloat16
+    scaler = torch.amp.GradScaler("cuda", enabled=(args.fp16 and device == "cuda"))
     accum = max(1, args.grad_accum)
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -102,7 +105,8 @@ def main() -> None:
         print(f"warm-started weights from {args.init_from} "
               f"(fresh optimizer/epochs; keeping its latent stats)", flush=True)
 
-    print(f"train={len(train_ds)} val={len(val_ds)} | device={device} | bf16={amp} | "
+    precision = "fp16" if args.fp16 else ("bf16" if args.bf16 else "fp32")
+    print(f"train={len(train_ds)} val={len(val_ds)} | device={device} | precision={precision} | "
           f"batch={args.batch_size} x accum {accum} = eff {args.batch_size * accum} | "
           f"{n_batches} batches/epoch", flush=True)
 
@@ -121,13 +125,15 @@ def main() -> None:
         opt.zero_grad()
         opt_steps = 0
         for i, batch in enumerate(train_dl):
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+            with torch.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                 out_losses = model.loss(batch["text_tokens"], batch["text_lens"],
                                         batch["latents"].to(device), batch["lat_lens"])
-            (out_losses["total"] / accum).backward()
+            scaler.scale(out_losses["total"] / accum).backward()
             if (i + 1) % accum == 0:
+                scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(core.parameters(), 1.0)
-                opt.step()
+                scaler.step(opt)
+                scaler.update()
                 opt.zero_grad()
                 opt_steps += 1
                 if args.save_every and opt_steps % args.save_every == 0:
