@@ -32,6 +32,42 @@ def evaluate(model, loader, device):
     return total / max(1, count)
 
 
+class EMA:
+    def __init__(self, model, decay: float):
+        self.decay = decay
+        self.shadow = {k: v.detach().clone().float() for k, v in model.state_dict().items()}
+
+    def update(self, model):
+        for k, v in model.state_dict().items():
+            if v.dtype.is_floating_point:
+                self.shadow[k].mul_(self.decay).add_(v.detach().float(), alpha=1 - self.decay)
+            else:
+                self.shadow[k].copy_(v)
+
+    def weights(self, ref_state):
+        return {k: self.shadow[k].to(ref_state[k].dtype) for k in ref_state}
+
+    def state_dict(self):
+        return self.shadow
+
+    def load(self, sd):
+        for k in self.shadow:
+            if k in sd:
+                self.shadow[k].copy_(sd[k])
+
+
+def make_scheduler(opt, warmup: int, total: int, final_ratio: float = 0.1):
+    import math
+
+    def fn(step):
+        if step < warmup:
+            return (step + 1) / max(1, warmup)
+        progress = min(1.0, (step - warmup) / max(1, total - warmup))
+        return final_ratio + (1 - final_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(opt, fn)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Train PocketLFM2 (LFM2 backbone) on a latent cache.")
     ap.add_argument("--cache", required=True)
@@ -55,6 +91,13 @@ def main() -> None:
     ap.add_argument("--resume", default=None, help="resume same run (model+optimizer+epoch+best)")
     ap.add_argument("--init-from", default=None,
                     help="warm-start weights from a checkpoint (fresh optimizer/epochs); for fine-tuning")
+    ap.add_argument("--warmup", type=int, default=500, help="LR warmup steps, then cosine decay to 10%")
+    ap.add_argument("--ema-decay", type=float, default=0.999,
+                    help="EMA decay (0 disables); EMA weights are used for val + saved as best (better audio)")
+    ap.add_argument("--eos-weight", type=float, default=1.0,
+                    help="weight on the stop/EOS loss; raise to ~3-5 for a cleaner automatic cutoff")
+    ap.add_argument("--patience", type=int, default=0,
+                    help="early stop after this many validations with no improvement (0 = never)")
     args = ap.parse_args()
 
     device = args.device
@@ -64,7 +107,7 @@ def main() -> None:
         dataset = Subset(dataset, range(min(len(dataset), args.limit)))
 
     latent_dim = dataset[0][1].shape[-1]
-    cfg = LFM2Config(latent_dim=latent_dim, input_noise=args.input_noise)
+    cfg = LFM2Config(latent_dim=latent_dim, input_noise=args.input_noise, eos_weight=args.eos_weight)
     model = PocketLFM2(cfg).to(device)
     mean, std = latent_stats(dataset)
     model.set_latent_stats(mean, std)
@@ -88,6 +131,11 @@ def main() -> None:
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     n_batches = len(train_dl)
+    total_steps = max(1, (n_batches // accum) * args.epochs)
+    scheduler = make_scheduler(opt, args.warmup, total_steps)
+    ema = EMA(core, args.ema_decay) if args.ema_decay > 0 else None
+    global_step = 0
+    stale = 0
 
     best = float("inf")
     start_epoch = 0
@@ -96,6 +144,11 @@ def main() -> None:
         core.load_state_dict(ck["model"])
         if "opt" in ck:
             opt.load_state_dict(ck["opt"])
+        if "scheduler" in ck:
+            scheduler.load_state_dict(ck["scheduler"])
+        if ema is not None and "ema" in ck:
+            ema.load(ck["ema"])
+        global_step = ck.get("step", 0)
         best = ck.get("best", float("inf"))
         start_epoch = ck.get("epoch", 0)
         print(f"resumed from {args.resume} @ epoch {start_epoch} (best val {best:.4f})", flush=True)
@@ -110,16 +163,35 @@ def main() -> None:
           f"batch={args.batch_size} x accum {accum} = eff {args.batch_size * accum} | "
           f"{n_batches} batches/epoch", flush=True)
 
+    def eval_ema():
+        if ema is None:
+            return evaluate(model, val_dl, device)
+        backup = {k: v.detach().clone() for k, v in core.state_dict().items()}
+        core.load_state_dict(ema.weights(core.state_dict()))
+        v = evaluate(model, val_dl, device)
+        core.load_state_dict(backup)
+        return v
+
     def save_state(val_loss, next_epoch):
-        nonlocal best
-        ckpt = {"cfg": asdict(cfg), "model": core.state_dict(), "opt": opt.state_dict(),
-                "epoch": next_epoch, "best": min(best, val_loss)}
-        torch.save(ckpt, out / "lfm2_last.pt")
+        nonlocal best, stale
+        last_ckpt = {"cfg": asdict(cfg), "model": core.state_dict(), "opt": opt.state_dict(),
+                     "scheduler": scheduler.state_dict(), "epoch": next_epoch,
+                     "best": min(best, val_loss), "step": global_step}
+        if ema is not None:
+            last_ckpt["ema"] = ema.state_dict()
+        torch.save(last_ckpt, out / "lfm2_last.pt")
         if val_loss < best:
-            best = val_loss
-            torch.save(ckpt, out / "lfm2_best.pt")
-            print(f"  saved best (val {val_loss:.4f}) -> {out / 'lfm2_best.pt'}", flush=True)
+            best, stale = val_loss, 0
+            infer_model = ema.weights(core.state_dict()) if ema is not None else core.state_dict()
+            torch.save({"cfg": asdict(cfg), "model": infer_model}, out / "lfm2_best.pt")
+            print(f"  saved best (val {val_loss:.4f}{' EMA' if ema else ''}) -> {out / 'lfm2_best.pt'}",
+                  flush=True)
+        else:
+            stale += 1
+    stop = False
     for epoch in range(start_epoch, args.epochs):
+        if stop:
+            break
         model.train()
         running, window, t0, last = 0.0, 0.0, time.monotonic(), time.monotonic()
         opt.zero_grad()
@@ -134,13 +206,21 @@ def main() -> None:
                 torch.nn.utils.clip_grad_norm_(core.parameters(), 1.0)
                 scaler.step(opt)
                 scaler.update()
+                scheduler.step()
+                if ema is not None:
+                    ema.update(core)
                 opt.zero_grad()
                 opt_steps += 1
+                global_step += 1
                 if args.save_every and opt_steps % args.save_every == 0:
-                    val_loss = evaluate(model, val_dl, device)
-                    print(f"  [mid-epoch] opt-step {opt_steps} | val {val_loss:.4f}", flush=True)
+                    val_loss = eval_ema()
+                    print(f"  [mid-epoch] step {global_step} | val {val_loss:.4f} | "
+                          f"lr {scheduler.get_last_lr()[0]:.2e}", flush=True)
                     save_state(val_loss, epoch)
                     model.train()
+                    if args.patience and stale >= args.patience:
+                        stop = True
+                        break
             running += float(out_losses["total"].detach())
             window += float(out_losses["total"].detach())
 
@@ -154,12 +234,20 @@ def main() -> None:
                       f"eta {eta / 60:.1f} min", flush=True)
                 window = 0.0
 
+        if stop:
+            print(f"early stop: no val improvement in {args.patience} checks "
+                  f"(best {best:.4f})", flush=True)
+            continue
         train_loss = running / max(1, n_batches)
-        val_loss = evaluate(model, val_dl, device)
+        val_loss = eval_ema()
         dt = time.monotonic() - t0
-        print(f"epoch {epoch + 1}/{args.epochs} done ({dt:.0f}s) | "
-              f"train {train_loss:.4f} | val {val_loss:.4f}", flush=True)
+        print(f"epoch {epoch + 1}/{args.epochs} done ({dt:.0f}s) | train {train_loss:.4f} | "
+              f"val {val_loss:.4f} | lr {scheduler.get_last_lr()[0]:.2e}", flush=True)
         save_state(val_loss, epoch + 1)
+        if args.patience and stale >= args.patience:
+            stop = True
+            print(f"early stop: no val improvement in {args.patience} checks "
+                  f"(best {best:.4f})", flush=True)
 
 
 if __name__ == "__main__":
