@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import resource
+import os
 import subprocess
 import sys
 import time
@@ -11,6 +11,14 @@ import torch
 
 FRAME_RATE = 12.5
 SAMPLE_RATE = 24000
+
+
+def _rss_mb() -> float:
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024.0
+    return 0.0
 
 
 def _decode(mimi, denorm_latents):
@@ -28,14 +36,18 @@ def _load_lfm2(args):
     from pocketlfm.pocketlfm2 import LFM2Config, PocketLFM2
 
     mimi, tok, _, _ = load_pretrained_codec(args.language)
-    mimi = mimi.float().eval()
+    mimi = mimi.float().cpu().eval()
     if args.ckpt:
+        import gc
+
         ck = torch.load(args.ckpt, map_location="cpu")
         model = PocketLFM2(LFM2Config(**ck["cfg"]))
         model.load_state_dict(ck["model"])
+        del ck
+        gc.collect()
     else:
         model = PocketLFM2(LFM2Config())
-    model = model.float().eval()
+    model = model.float().cpu().eval()
     tokens = torch.tensor([tok.sp.encode(args.text, out_type=int)], dtype=torch.long)
 
     def gen(n):
@@ -52,8 +64,8 @@ def _load_pockettts(args):
     from pocket_tts.modules.stateful_module import increment_steps, init_states
 
     tts = TTSModel.load_model(language=args.language)
-    flow = tts.flow_lm.float().eval()
-    mimi = tts.mimi.float().eval()
+    flow = tts.flow_lm.float().cpu().eval()
+    mimi = tts.mimi.float().cpu().eval()
     tok = flow.conditioner.tokenizer
     tokens = torch.tensor([tok.sp.encode(args.text, out_type=int)], dtype=torch.long)
     text_emb = flow.conditioner(TokenizedText(tokens))
@@ -93,7 +105,7 @@ def run_worker(args) -> None:
     dec_s = time.monotonic() - t
 
     audio_s = wav.shape[-1] / SAMPLE_RATE
-    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+    peak = _rss_mb()
     print("RESULT " + json.dumps({
         "model": args.worker, "params_m": params / 1e6, "weight_mb": weight / 1e6,
         "peak_rss_mb": peak, "lm_s": lm_s, "dec_s": dec_s, "audio_s": audio_s,
@@ -146,8 +158,9 @@ def main() -> None:
                "--threads", str(args.threads), "--language", args.language]
         if args.ckpt and model == "lfm2":
             cmd += ["--ckpt", args.ckpt]
-        print(f"running {model} (isolated process) ...", flush=True)
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        print(f"running {model} (isolated process, cpu) ...", flush=True)
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
         line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")), None)
         if line is None:
             print(proc.stdout[-1500:])
