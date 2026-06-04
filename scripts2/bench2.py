@@ -38,13 +38,9 @@ def _load_lfm2(args):
     mimi, tok, _, _ = load_pretrained_codec(args.language)
     mimi = mimi.float().cpu().eval()
     if args.ckpt:
-        import gc
-
-        ck = torch.load(args.ckpt, map_location="cpu")
+        ck = torch.load(args.ckpt, map_location="cpu", mmap=True)
         model = PocketLFM2(LFM2Config(**ck["cfg"]))
         model.load_state_dict(ck["model"])
-        del ck
-        gc.collect()
     else:
         model = PocketLFM2(LFM2Config())
     model = model.float().cpu().eval()
