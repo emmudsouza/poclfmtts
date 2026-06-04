@@ -29,7 +29,8 @@ def build_voice_prompt(root: str, sr: int, n_clips: int, device: str) -> torch.T
     rows = read_metadata(root)
     chunks = []
     for cid, _ in rows[:n_clips]:
-        wav, file_sr = torchaudio.load(str(pathlib.Path(root) / "wavs" / f"{cid}.wav"))
+        wav, file_sr = torchaudio.load(
+            str(pathlib.Path(root) / "wavs" / f"{cid}.wav"))
         wav = wav.mean(0, keepdim=True)
         if file_sr != sr:
             wav = torchaudio.functional.resample(wav, file_sr, sr)
@@ -38,15 +39,20 @@ def build_voice_prompt(root: str, sr: int, n_clips: int, device: str) -> torch.T
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Distill PocketTTS into a single-voice latent cache.")
-    ap.add_argument("--root", default="data/LJSpeech-1.1", help="LJSpeech root (for text + voice)")
+    ap = argparse.ArgumentParser(
+        description="Distill PocketTTS into a single-voice latent cache.")
+    ap.add_argument("--root", default="data/LJSpeech-1.1",
+                    help="LJSpeech root (for text + voice)")
     ap.add_argument("--out", default="data/distill_cache")
     ap.add_argument("--voice", default="azelma",
                     help="built-in voice name (e.g. azelma, alba, anna), a wav / hf:// URL, "
                          "or 'ljspeech' to build a prompt from LJSpeech clips")
-    ap.add_argument("--voice-clips", type=int, default=6, help="LJSpeech clips for --voice ljspeech")
-    ap.add_argument("--texts", default=None, help="text file (one per line); default = LJSpeech transcripts")
-    ap.add_argument("--limit", type=int, default=2000, help="number of utterances to synthesize")
+    ap.add_argument("--voice-clips", type=int, default=6,
+                    help="LJSpeech clips for --voice ljspeech")
+    ap.add_argument("--texts", default=None,
+                    help="text file (one per line); default = LJSpeech transcripts")
+    ap.add_argument("--limit", type=int, default=2000,
+                    help="number of utterances to synthesize")
     ap.add_argument("--device", default=None)
     ap.add_argument("--language", default="english")
     args = ap.parse_args()
@@ -65,14 +71,17 @@ def main() -> None:
     if args.voice == "ljspeech":
         prompt = build_voice_prompt(args.root, sr, args.voice_clips, device)
         voice_state = tts.get_state_for_audio_prompt(prompt)
-        print(f"voice: LJSpeech ({args.voice_clips} clips) | device={device} | sr={sr}")
+        print(
+            f"voice: LJSpeech ({args.voice_clips} clips) | device={device} | sr={sr}")
     else:
-        origin = PREDEFINED.get(args.voice, args.voice)  # built-in name -> URL, else pass-through
+        # built-in name -> URL, else pass-through
+        origin = PREDEFINED.get(args.voice, args.voice)
         voice_state = tts.get_state_for_audio_prompt(origin)
         print(f"voice: {args.voice} -> {origin} | device={device} | sr={sr}")
 
     if args.texts:
-        texts = [ln.strip() for ln in open(args.texts, encoding="utf-8") if ln.strip()]
+        texts = [ln.strip()
+                 for ln in open(args.texts, encoding="utf-8") if ln.strip()]
         ids = [f"D{i:06d}" for i in range(len(texts))]
     else:
         rows = read_metadata(args.root)
@@ -91,7 +100,8 @@ def main() -> None:
             continue
         try:
             with torch.no_grad():
-                audio = tts.generate_audio(voice_state, text, copy_state=True)  # [C, samples]
+                audio = tts.generate_audio(
+                    voice_state, text, copy_state=True)  # [C, samples]
                 audio = audio.to(device)
                 if audio.dim() == 1:
                     audio = audio[None]
@@ -100,8 +110,10 @@ def main() -> None:
                 if audio.shape[1] > 1:
                     audio = audio.mean(1, keepdim=True)
                 latent = mimi.encode_to_latent(audio)  # [1, 32, T]
-            latent = latent[0].transpose(0, 1).contiguous().to("cpu", torch.float16)  # [T, 32]
-            tokens = torch.tensor(tokenizer.sp.encode(text, out_type=int), dtype=torch.long)
+            latent = latent[0].transpose(0, 1).contiguous().to(
+                "cpu", torch.float16)  # [T, 32]
+            tokens = torch.tensor(tokenizer.sp.encode(
+                text, out_type=int), dtype=torch.long)
             torch.save({"tokens": tokens, "latents": latent}, path)
             index.append(cid)
             done += 1
@@ -110,7 +122,8 @@ def main() -> None:
             if skipped <= 5:
                 print(f"  skip {cid}: {exc}")
         if (i + 1) % 100 == 0:
-            print(f"  {i + 1}/{len(ids)} synthesized ({done} ok, {skipped} skipped)")
+            print(
+                f"  {i + 1}/{len(ids)} synthesized ({done} ok, {skipped} skipped)")
 
     (out / "index.txt").write_text("\n".join(index))
     print(f"Done. {len(index)} clips distilled to {out} (skipped {skipped}).")
@@ -118,3 +131,16 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# # 1. Distill ~2000 utterances in azelma's voice (latent cache is tiny, ~15MB)
+# python scripts/distill.py --out data/distill_cache --limit 2000 --voice azelma --device cuda
+
+# # 2. Train on the clean single-voice targets
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+# python scripts/train.py --cache data/distill_cache --out runs/distill \
+#   --epochs 30 --batch-size 16 --bf16 --val-split 0.02
+
+# # 3. Listen
+# python scripts/infer.py --ckpt runs/distill/pocketlfm_best.pt \
+#   --text "the quick brown fox jumps over the lazy dog" --out distill.wav --device cuda

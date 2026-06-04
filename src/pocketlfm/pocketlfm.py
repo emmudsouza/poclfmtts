@@ -29,14 +29,8 @@ class PocketLFMConfig:
     max_text_len: int = 512
 
     mtp_horizon: int = 4
-    depth_dim: int = 256
-    depth_layers: int = 1
     head_dim: int = 192
     head_depth: int = 2
-    shortcut_max_level: int = 7
-
-    num_emotions: int = 8
-    ref_pool_heads: int = 4
 
     attn_window: int | None = 384
     attn_sink: int = 128
@@ -204,9 +198,7 @@ class LFMBackbone(nn.Module):
     def init_state(self) -> dict:
         return {"offset": 0, "layers": [None] * len(self.layers)}
 
-    def forward(self, x, state=None, global_cond=None):
-        if global_cond is not None:
-            x = x + global_cond[:, None, :]
+    def forward(self, x, state=None):
         t = x.shape[1]
         offset = 0 if state is None else state["offset"]
         positions = torch.arange(offset, offset + t, device=x.device)
@@ -265,26 +257,6 @@ class TextEncoder(nn.Module):
         return self.norm(self.proj(x))
 
 
-class ReferenceEncoder(nn.Module):
-    def __init__(self, cfg: PocketLFMConfig):
-        super().__init__()
-        self.proj = nn.Linear(cfg.latent_dim, cfg.d_model, bias=False)
-        self.query = nn.Parameter(torch.randn(cfg.d_model))
-        self.attn = nn.MultiheadAttention(cfg.d_model, cfg.ref_pool_heads, batch_first=True)
-        self.out = SwiGLU(cfg.d_model, cfg.d_model)
-        self.norm = RMSNorm(cfg.d_model, cfg.norm_eps)
-        self.unconditional = nn.Parameter(torch.zeros(cfg.d_model))
-
-    def forward(self, ref_latents, ref_mask, batch_size, device):
-        if ref_latents is None:
-            return self.unconditional[None, :].expand(batch_size, -1)
-        x = self.proj(ref_latents)
-        q = self.query[None, None, :].expand(x.shape[0], 1, -1)
-        pad = ~ref_mask if ref_mask is not None else None
-        pooled, _ = self.attn(q, x, x, key_padding_mask=pad)
-        return pooled[:, 0] + self.out(self.norm(pooled[:, 0]))
-
-
 class TimestepEmbed(nn.Module):
     def __init__(self, hidden: int):
         super().__init__()
@@ -314,21 +286,19 @@ class AdaLNBlock(nn.Module):
         return x + gate * self.mlp(self.norm(x) * (1 + scale) + shift)
 
 
-class ShortcutFlowHead(nn.Module):
+class FlowHead(nn.Module):
     def __init__(self, cfg: PocketLFMConfig, cond_dim: int):
         super().__init__()
         self.latent_dim = cfg.latent_dim
-        self.max_level = cfg.shortcut_max_level
         hidden = cfg.head_dim
         self.in_proj = nn.Linear(cfg.latent_dim, hidden)
         self.cond_proj = nn.Linear(cond_dim, hidden)
         self.t_embed = TimestepEmbed(hidden)
-        self.d_embed = TimestepEmbed(hidden)
         self.blocks = nn.ModuleList([AdaLNBlock(hidden) for _ in range(cfg.head_depth)])
         self.out = nn.Linear(hidden, cfg.latent_dim)
 
-    def velocity(self, cond, t, d, x):
-        c = self.cond_proj(cond) + self.t_embed(t) + self.d_embed(d)
+    def velocity(self, cond, t, x):
+        c = self.cond_proj(cond) + self.t_embed(t)
         h = self.in_proj(x)
         for block in self.blocks:
             h = block(h, c)
@@ -341,88 +311,39 @@ class ShortcutFlowHead(nn.Module):
         dt = 1.0 / steps
         for i in range(steps):
             t = torch.full((b, 1), i * dt, device=cond.device)
-            d = torch.full((b, 1), dt, device=cond.device)
-            x = x + self.velocity(cond, t, d, x) * dt
+            x = x + self.velocity(cond, t, x) * dt
         return x
 
     def loss(self, cond, target):
-        b = target.shape[0]
-        device = target.device
         noise = torch.randn_like(target)
-        zeros = torch.zeros(b, 1, device=device)
-
-        t = torch.rand(b, 1, device=device)
+        t = torch.rand(target.shape[0], 1, device=target.device)
         x_t = (1 - t) * noise + t * target
-        flow = F.mse_loss(self.velocity(cond, t, zeros, x_t), target - noise)
-
-        level = int(torch.randint(1, self.max_level + 1, (1,)).item())
-        two_d = 2.0 ** -(level - 1)
-        d = two_d / 2.0
-        steps = max(1, int(round(1.0 / two_d)))
-        j = torch.randint(0, steps, (b, 1), device=device).float()
-        ts = j * two_d
-        x_ts = (1 - ts) * noise + ts * target
-        d_col = torch.full((b, 1), d, device=device)
-        two_col = torch.full((b, 1), two_d, device=device)
-        s1 = self.velocity(cond, ts, d_col, x_ts)
-        s2 = self.velocity(cond, ts + d, d_col, x_ts + d * s1)
-        target_big = (0.5 * (s1 + s2)).detach()
-        consistency = F.mse_loss(self.velocity(cond, ts, two_col, x_ts), target_big)
-        return flow + consistency
+        return F.mse_loss(self.velocity(cond, t, x_t), target - noise)
 
 
-class DepthTransformer(nn.Module):
-    def __init__(self, cfg: PocketLFMConfig):
-        super().__init__()
-        self.horizon = cfg.mtp_horizon
-        self.dim = cfg.depth_dim
-        self.hidden_proj = nn.Linear(cfg.d_model, cfg.depth_dim, bias=False)
-        self.latent_proj = nn.Linear(cfg.latent_dim, cfg.depth_dim, bias=False)
-        self.start = nn.Parameter(torch.randn(cfg.depth_dim))
-        self.pos = nn.Parameter(torch.randn(cfg.mtp_horizon, cfg.depth_dim))
-        self.blocks = nn.ModuleList(
-            [TransformerBlock(cfg.depth_dim, cfg.ref_pool_heads, cfg.depth_dim * 2, causal=True,
-                              eps=cfg.norm_eps)
-             for _ in range(cfg.depth_layers)]
-        )
-        self.norm = RMSNorm(cfg.depth_dim, cfg.norm_eps)
-
-    def _tokens(self, hidden, prev_latents):
-        n = hidden.shape[0]
-        start = self.start[None, None, :].expand(n, 1, -1)
-        if prev_latents is None or prev_latents.shape[1] == 0:
-            seq = start
-        else:
-            seq = torch.cat([start, self.latent_proj(prev_latents)], dim=1)
-        seq = seq + self.hidden_proj(hidden)[:, None, :]
-        seq = seq + self.pos[: seq.shape[1]][None]
-        return seq
-
-    def forward(self, hidden, prev_latents):
-        seq = self._tokens(hidden, prev_latents)
-        for block in self.blocks:
-            seq = block(seq)
-        return self.norm(seq)
-
-
-class SequentialMTP(nn.Module):
+class MTPHeads(nn.Module):
     def __init__(self, cfg: PocketLFMConfig):
         super().__init__()
         self.horizon = cfg.mtp_horizon
         self.latent_dim = cfg.latent_dim
-        self.depth = DepthTransformer(cfg)
-        self.head = ShortcutFlowHead(cfg, cfg.depth_dim)
+        self.head_embed = nn.Parameter(torch.randn(cfg.mtp_horizon, cfg.d_model) * 0.02)
+        self.head = FlowHead(cfg, cfg.d_model)
 
     def loss(self, hidden, targets, mask):
-        conds = self.depth(hidden, targets[:, :-1])
         total = hidden.new_zeros(())
         count = 0
         for k in range(self.horizon):
             m = mask[:, k]
             if m.any():
-                total = total + self.head.loss(conds[:, k][m], targets[m, k])
+                total = total + self.head.loss(hidden[m] + self.head_embed[k], targets[m, k])
                 count += 1
         return total / max(1, count)
+
+    def sample(self, hidden, steps, temp):
+        return torch.stack(
+            [self.head.sample(hidden + self.head_embed[k], steps, temp) for k in range(self.horizon)],
+            dim=1,
+        )
 
 
 class PocketLFM(nn.Module):
@@ -430,14 +351,11 @@ class PocketLFM(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.text_encoder = TextEncoder(cfg)
-        self.reference = ReferenceEncoder(cfg)
-        self.emotion = nn.Embedding(cfg.num_emotions, cfg.d_model)
-        self.cond_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.latent_in = nn.Linear(cfg.latent_dim, cfg.d_model, bias=False)
         self.bos = nn.Parameter(torch.randn(cfg.latent_dim))
         self.backbone = LFMBackbone(cfg)
         self.out_norm = RMSNorm(cfg.d_model, cfg.norm_eps)
-        self.mtp = SequentialMTP(cfg)
+        self.mtp = MTPHeads(cfg)
         self.eos_head = nn.Linear(cfg.d_model, 1)
         self.register_buffer("latent_mean", torch.zeros(cfg.latent_dim))
         self.register_buffer("latent_std", torch.ones(cfg.latent_dim))
@@ -464,33 +382,17 @@ class PocketLFM(nn.Module):
             "text_encoder": count(self.text_encoder),
             "backbone": count(self.backbone),
             "mtp": count(self.mtp),
-            "conditioning": count(self.reference) + count(self.emotion),
         }
         parts["other"] = total - sum(parts.values())
         parts["total"] = total
         return parts
-
-    def _conditioning(self, batch_size, device, ref_latents, ref_mask, emotion):
-        speaker = self.reference(ref_latents, ref_mask, batch_size, device)
-        if emotion is None:
-            emotion = torch.zeros(batch_size, dtype=torch.long, device=device)
-        return self.cond_proj(speaker + self.emotion(emotion))
 
     def _text_prefix(self, text_tokens, text_lens):
         device = text_tokens.device
         mask = torch.arange(text_tokens.shape[1], device=device)[None, :] < text_lens.to(device)[:, None]
         return self.text_encoder(text_tokens, mask)
 
-    def _global_cond(self, b, device, ref_latents, ref_lens, emotion):
-        ref_mask = None
-        if ref_latents is not None and ref_lens is not None:
-            ref_mask = torch.arange(ref_latents.shape[1], device=device)[None, :] < ref_lens.to(
-                device
-            )[:, None]
-        return self._conditioning(b, device, ref_latents, ref_mask, emotion)
-
-    def compute_losses(self, text_tokens, text_lens, latents, lat_lens,
-                       ref_latents=None, ref_lens=None, emotion=None) -> dict[str, torch.Tensor]:
+    def compute_losses(self, text_tokens, text_lens, latents, lat_lens) -> dict[str, torch.Tensor]:
         b, t_max, _ = latents.shape
         k = self.cfg.mtp_horizon
         d = self.cfg.d_model
@@ -500,7 +402,6 @@ class PocketLFM(nn.Module):
         latents = self.normalize(latents)
 
         text_emb = self._text_prefix(text_tokens, text_lens)
-        global_cond = self._global_cond(b, device, ref_latents, ref_lens, emotion)
 
         ctx = latents
         if self.training and self.cfg.input_noise > 0:
@@ -513,7 +414,7 @@ class PocketLFM(nn.Module):
             audio_in = torch.cat([bos, ctx[i, : t - 1]], dim=0)
             seqs.append(torch.cat([text_emb[i, :lt], self.latent_in(audio_in)], dim=0))
         packed = nn.utils.rnn.pad_sequence(seqs, batch_first=True)
-        hidden = self.out_norm(self.backbone(packed, global_cond=global_cond))
+        hidden = self.out_norm(self.backbone(packed))
 
         audio_h = latents.new_zeros(b, t_max, d)
         for i in range(b):
@@ -543,43 +444,32 @@ class PocketLFM(nn.Module):
         return {"mtp": mtp, "eos": eos, "total": total}
 
     @torch.no_grad()
-    def stream_latents(self, text_tokens, max_frames, flow_steps=1, temp=1.0,
-                      eos_threshold=0.0, ref_latents=None, ref_lens=None, emotion=None):
+    def stream_latents(self, text_tokens, max_frames, flow_steps=1, temp=1.0, eos_threshold=0.0):
         b = text_tokens.shape[0]
         device = text_tokens.device
         text_lens = torch.full((b,), text_tokens.shape[1], device=device)
         text_emb = self._text_prefix(text_tokens, text_lens)
-        global_cond = self._global_cond(b, device, ref_latents, ref_lens, emotion)
 
         state = self.backbone.init_state()
-        self.backbone(text_emb, state, global_cond=global_cond)
+        self.backbone(text_emb, state)
         bos = self.bos.view(1, 1, -1).expand(b, 1, -1)
-        hidden = self.out_norm(self.backbone(self.latent_in(bos), state, global_cond=global_cond))
+        hidden = self.out_norm(self.backbone(self.latent_in(bos), state))
 
         produced = 0
         while produced < max_frames:
-            prev = hidden.new_zeros(b, 0, self.cfg.latent_dim)
+            block = self.mtp.sample(hidden[:, -1], flow_steps, temp)
             for k in range(self.cfg.mtp_horizon):
-                cond = self.mtp.depth(hidden[:, -1], prev if k > 0 else None)[:, k]
-                z = self.mtp.head.sample(cond, flow_steps, temp)
-                yield self.denormalize(z)
+                yield self.denormalize(block[:, k])
                 produced += 1
-                prev = torch.cat([prev, z[:, None, :]], dim=1)
                 if produced >= max_frames:
                     return
-            hidden = self.out_norm(
-                self.backbone(self.latent_in(prev), state, global_cond=global_cond)
-            )
+            hidden = self.out_norm(self.backbone(self.latent_in(block), state))
             if (self.eos_head(hidden[:, -1:]) > eos_threshold).all():
                 return
 
     @torch.no_grad()
-    def generate_latents(self, text_tokens, max_frames, flow_steps=1, temp=1.0,
-                        eos_threshold=0.0, ref_latents=None, ref_lens=None, emotion=None):
-        frames = list(
-            self.stream_latents(text_tokens, max_frames, flow_steps, temp, eos_threshold,
-                                ref_latents, ref_lens, emotion)
-        )
+    def generate_latents(self, text_tokens, max_frames, flow_steps=1, temp=1.0, eos_threshold=0.0):
+        frames = list(self.stream_latents(text_tokens, max_frames, flow_steps, temp, eos_threshold))
         return torch.stack(frames, dim=1)[:, :max_frames]
 
 
