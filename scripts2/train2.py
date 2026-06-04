@@ -49,6 +49,9 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--grad-accum", type=int, default=1)
     ap.add_argument("--log-every", type=int, default=20)
+    ap.add_argument("--save-every", type=int, default=0,
+                    help="also checkpoint every N optimizer steps (0 = only per epoch)")
+    ap.add_argument("--resume", default=None, help="resume from a checkpoint (model+optimizer+epoch)")
     args = ap.parse_args()
 
     device = args.device
@@ -64,6 +67,7 @@ def main() -> None:
     model.set_latent_stats(mean, std)
     for key, val in model.param_breakdown().items():
         print(f"  {key:10s}: {val:6.1f}M")
+    core = model
     if args.compile:
         model = torch.compile(model)
 
@@ -73,30 +77,57 @@ def main() -> None:
                           collate_fn=collate, num_workers=args.workers, drop_last=True)
     val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    opt = torch.optim.AdamW(core.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     amp = args.bf16 and device == "cuda"
     accum = max(1, args.grad_accum)
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     n_batches = len(train_dl)
+
+    best = float("inf")
+    start_epoch = 0
+    if args.resume:
+        ck = torch.load(args.resume, map_location=device)
+        core.load_state_dict(ck["model"])
+        if "opt" in ck:
+            opt.load_state_dict(ck["opt"])
+        best = ck.get("best", float("inf"))
+        start_epoch = ck.get("epoch", 0)
+        print(f"resumed from {args.resume} @ epoch {start_epoch} (best val {best:.4f})", flush=True)
+
     print(f"train={len(train_ds)} val={len(val_ds)} | device={device} | bf16={amp} | "
           f"batch={args.batch_size} x accum {accum} = eff {args.batch_size * accum} | "
           f"{n_batches} batches/epoch", flush=True)
 
-    best = float("inf")
-    for epoch in range(args.epochs):
+    def save_state(val_loss, next_epoch):
+        nonlocal best
+        ckpt = {"cfg": asdict(cfg), "model": core.state_dict(), "opt": opt.state_dict(),
+                "epoch": next_epoch, "best": min(best, val_loss)}
+        torch.save(ckpt, out / "lfm2_last.pt")
+        if val_loss < best:
+            best = val_loss
+            torch.save(ckpt, out / "lfm2_best.pt")
+            print(f"  saved best (val {val_loss:.4f}) -> {out / 'lfm2_best.pt'}", flush=True)
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         running, window, t0, last = 0.0, 0.0, time.monotonic(), time.monotonic()
         opt.zero_grad()
+        opt_steps = 0
         for i, batch in enumerate(train_dl):
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
                 out_losses = model.loss(batch["text_tokens"], batch["text_lens"],
                                         batch["latents"].to(device), batch["lat_lens"])
             (out_losses["total"] / accum).backward()
             if (i + 1) % accum == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(core.parameters(), 1.0)
                 opt.step()
                 opt.zero_grad()
+                opt_steps += 1
+                if args.save_every and opt_steps % args.save_every == 0:
+                    val_loss = evaluate(model, val_dl, device)
+                    print(f"  [mid-epoch] opt-step {opt_steps} | val {val_loss:.4f}", flush=True)
+                    save_state(val_loss, epoch)
+                    model.train()
             running += float(out_losses["total"].detach())
             window += float(out_losses["total"].detach())
 
@@ -115,13 +146,7 @@ def main() -> None:
         dt = time.monotonic() - t0
         print(f"epoch {epoch + 1}/{args.epochs} done ({dt:.0f}s) | "
               f"train {train_loss:.4f} | val {val_loss:.4f}", flush=True)
-
-        ckpt = {"cfg": asdict(cfg), "model": model.state_dict()}
-        torch.save(ckpt, out / "lfm2_last.pt")
-        if val_loss < best:
-            best = val_loss
-            torch.save(ckpt, out / "lfm2_best.pt")
-            print(f"  saved best (val {val_loss:.4f}) -> {out / 'lfm2_best.pt'}", flush=True)
+        save_state(val_loss, epoch + 1)
 
 
 if __name__ == "__main__":
